@@ -28,6 +28,7 @@ Usage:
 import argparse
 import json
 import logging
+import math
 import random
 import sys
 from collections import defaultdict
@@ -210,47 +211,108 @@ class TypeSelector:
 # Balanced type selector (minimises reuse)
 # ---------------------------------------------------------------------------
 
-class BalancedTypeSelector:
+def plan_balanced_assignments(
+    file_type_map: Dict[str, List[Path]],
+    min_types: int,
+    max_types: int,
+    rng: random.Random,
+) -> List[List[Tuple[str, Path]]]:
     """
-    Picks file_types for each merged document by prioritising those with the
-    most remaining unused PDFs.  This drains heavy types faster so that all
-    types converge to zero roughly together, producing the minimum number of
-    merged documents needed for full coverage and therefore the least reuse.
+    Pre-plan document assignments so each source PDF is used exactly once,
+    producing the minimum number of merged documents with zero reuse.
 
-    Algorithm per document:
-        1. Get ``remaining_unused`` counts from the pool.
-        2. Sort file_types descending by remaining count (ties broken randomly).
-        3. Pick the top *size* (random in [min_types, max_types]).
-        4. Shuffle the selected group so segment order inside the document
-           is randomised.
+    Algorithm:
+        1. Compute ``num_docs = max(ceil(total_pdfs / max_types), max_type_count)``
+           — the theoretical minimum number of documents.
+        2. Create ``num_docs`` empty plans.
+        3. Process file_types from largest to smallest PDF count.
+        4. For each PDF, assign to the document with the fewest items that
+           does not already contain that file_type and is not full.
+        5. Merge sub-minimum documents (< min_types items) by redistributing
+           their items into other documents that have room.
+        6. Shuffle internal order of each document + overall document order.
+
+    Returns:
+        List of plans, each plan is a list of (file_type, Path) tuples.
     """
+    total_pdfs = sum(len(paths) for paths in file_type_map.values())
+    max_type_count = max(len(paths) for paths in file_type_map.values())
+    num_docs = max(math.ceil(total_pdfs / max_types), max_type_count)
 
-    def __init__(
-        self,
-        pool: FileTypePool,
-        min_types: int,
-        max_types: int,
-        rng: random.Random,
-    ):
-        self._pool = pool
-        self._min = min_types
-        self._max = max_types
-        self._rng = rng
+    # Initialize empty plans and type-tracking sets per document
+    plans: List[List[Tuple[str, Path]]] = [[] for _ in range(num_docs)]
+    types_in_doc: List[set] = [set() for _ in range(num_docs)]
 
-    def next_group(self) -> List[str]:
-        remaining = self._pool.remaining_unused_all()
+    # Process types from largest to smallest count for best packing
+    sorted_types = sorted(
+        file_type_map.keys(), key=lambda ft: len(file_type_map[ft]), reverse=True
+    )
 
-        size = self._rng.randint(self._min, self._max)
-        size = min(size, len(remaining))
+    for ft in sorted_types:
+        pdfs = list(file_type_map[ft])
+        rng.shuffle(pdfs)
+        for pdf_path in pdfs:
+            # Find candidate documents: don't already have this type and not full
+            best_idx = None
+            best_size = float("inf")
+            for i in range(num_docs):
+                if ft in types_in_doc[i]:
+                    continue
+                if len(plans[i]) >= max_types:
+                    continue
+                if len(plans[i]) < best_size:
+                    best_size = len(plans[i])
+                    best_idx = i
+            if best_idx is None:
+                # All docs either have this type or are full — add a new doc
+                best_idx = len(plans)
+                plans.append([])
+                types_in_doc.append(set())
+                num_docs += 1
+            plans[best_idx].append((ft, pdf_path))
+            types_in_doc[best_idx].add(ft)
 
-        # Sort by remaining desc; shuffle first so ties are random
-        types = list(remaining.keys())
-        self._rng.shuffle(types)
-        types.sort(key=lambda ft: remaining[ft], reverse=True)
+    # Merge sub-minimum documents by redistributing their items
+    stable = False
+    while not stable:
+        stable = True
+        for i in range(len(plans) - 1, -1, -1):
+            if not plans[i] or len(plans[i]) >= min_types:
+                continue
+            # Try to redistribute items from this undersized doc
+            items_to_move = list(plans[i])
+            all_moved = True
+            for ft, pdf_path in items_to_move:
+                moved = False
+                # Find another doc that can accept this item
+                for j in range(len(plans)):
+                    if j == i:
+                        continue
+                    if ft in types_in_doc[j]:
+                        continue
+                    if len(plans[j]) >= max_types:
+                        continue
+                    plans[j].append((ft, pdf_path))
+                    types_in_doc[j].add(ft)
+                    moved = True
+                    break
+                if not moved:
+                    all_moved = False
+            if all_moved:
+                # Successfully redistributed all items — remove this doc
+                plans[i] = []
+                types_in_doc[i] = set()
+                stable = False
 
-        group = types[:size]
-        self._rng.shuffle(group)
-        return group
+    # Remove empty plans
+    plans = [p for p in plans if p]
+
+    # Shuffle internal order of each document and overall document order
+    for p in plans:
+        rng.shuffle(p)
+    rng.shuffle(plans)
+
+    return plans
 
 
 # ---------------------------------------------------------------------------
@@ -276,6 +338,69 @@ def generate_merged_document(
 
     for ft in selected_types:
         src_path = pool.take(ft)
+        pdf_bytes = src_path.read_bytes()
+        if not is_pdf(pdf_bytes):
+            logger.warning("Skipping non-PDF file: %s", src_path)
+            continue
+        page_count = get_page_count(pdf_bytes)
+        pdf_parts.append(pdf_bytes)
+        segment_infos.append({
+            "file_type": ft,
+            "category": get_category(ft),
+            "page_count": page_count,
+            "source_file": f"{ft}/{src_path.name}",
+        })
+
+    merged_bytes = merge_pdfs(pdf_parts)
+
+    # Build segments with cumulative page ranges
+    segments = []
+    current_page = 1
+    for idx, info in enumerate(segment_infos, start=1):
+        start = current_page
+        end = current_page + info["page_count"] - 1
+        segments.append({
+            "segment_id": f"segment_{idx}",
+            "category": info["category"],
+            "file_type": info["file_type"],
+            "start_page_number": start,
+            "end_page_number": end,
+            "source_file": info["source_file"],
+        })
+        current_page = end + 1
+
+    total_pages = current_page - 1
+
+    label = {
+        "document_name": doc_name,
+        "source_uri": f"{output_dir_name}/{doc_name}",
+        "segments": segments,
+        "total_pages": total_pages,
+    }
+
+    return merged_bytes, label
+
+
+def generate_merged_document_from_plan(
+    plan: List[Tuple[str, Path]],
+    doc_index: int,
+    output_dir_name: str,
+) -> Tuple[bytes, dict]:
+    """
+    Build one merged PDF from pre-assigned (file_type, path) pairs.
+
+    Same merge/label logic as ``generate_merged_document`` but uses
+    pre-planned assignments instead of drawing from a FileTypePool.
+
+    Returns:
+        (merged_pdf_bytes, label_dict)
+    """
+    doc_name = f"merged_{doc_index:04d}.pdf"
+
+    pdf_parts: List[bytes] = []
+    segment_infos: List[dict] = []
+
+    for ft, src_path in plan:
         pdf_bytes = src_path.read_bytes()
         if not is_pdf(pdf_bytes):
             logger.warning("Skipping non-PDF file: %s", src_path)
@@ -351,8 +476,6 @@ def run_generation(args: argparse.Namespace) -> dict:
     # Seed
     rng = random.Random(args.seed)
 
-    pool = FileTypePool(file_type_map, rng)
-
     # Determine mode
     mode = "exhaust"
     target_count: Optional[int] = None
@@ -361,12 +484,6 @@ def run_generation(args: argparse.Namespace) -> dict:
         target_count = args.count
     elif getattr(args, "balanced", False):
         mode = "balanced"
-
-    # Choose selector strategy
-    if mode == "balanced":
-        selector = BalancedTypeSelector(pool, args.min_types, args.max_types, rng)
-    else:
-        selector = TypeSelector(available_types, args.min_types, args.max_types, rng)
 
     # Prepare output directory
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -379,38 +496,71 @@ def run_generation(args: argparse.Namespace) -> dict:
 
     print(f"\nGenerating merged documents ({mode} mode) ...")
 
-    while True:
-        # Stop conditions
-        if mode == "count" and generated >= target_count:
-            break
-        if mode in ("exhaust", "balanced") and pool.all_used_at_least_once():
-            break
-
-        doc_index = generated + 1
-        group = selector.next_group()
-
-        merged_bytes, label = generate_merged_document(
-            pool, group, doc_index, output_dir_name
+    if mode == "balanced":
+        plans = plan_balanced_assignments(
+            file_type_map, args.min_types, args.max_types, rng
         )
+        print(f"  Pre-planned {len(plans)} documents (zero PDF reuse)")
 
-        # Write PDF
-        pdf_path = output_dir / label["document_name"]
-        pdf_path.write_bytes(merged_bytes)
+        for doc_index, plan in enumerate(plans, start=1):
+            merged_bytes, label = generate_merged_document_from_plan(
+                plan, doc_index, output_dir_name
+            )
 
-        # Write label JSON
-        json_name = label["document_name"].replace(".pdf", ".json")
-        json_path = output_dir / json_name
-        with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(label, f, indent=2, ensure_ascii=False)
+            # Write PDF
+            pdf_path = output_dir / label["document_name"]
+            pdf_path.write_bytes(merged_bytes)
 
-        # Track stats
-        generated += 1
-        total_pages += label["total_pages"]
-        for seg in label["segments"]:
-            type_distribution[seg["file_type"]] += 1
+            # Write label JSON
+            json_name = label["document_name"].replace(".pdf", ".json")
+            json_path = output_dir / json_name
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(label, f, indent=2, ensure_ascii=False)
 
-        if generated % 10 == 0 or generated == 1:
-            print(f"  [{generated}] {label['document_name']}  ({label['total_pages']} pages)")
+            # Track stats
+            generated += 1
+            total_pages += label["total_pages"]
+            for seg in label["segments"]:
+                type_distribution[seg["file_type"]] += 1
+
+            if generated % 10 == 0 or generated == 1:
+                print(f"  [{generated}] {label['document_name']}  ({label['total_pages']} pages)")
+    else:
+        pool = FileTypePool(file_type_map, rng)
+        selector = TypeSelector(available_types, args.min_types, args.max_types, rng)
+
+        while True:
+            # Stop conditions
+            if mode == "count" and generated >= target_count:
+                break
+            if mode == "exhaust" and pool.all_used_at_least_once():
+                break
+
+            doc_index = generated + 1
+            group = selector.next_group()
+
+            merged_bytes, label = generate_merged_document(
+                pool, group, doc_index, output_dir_name
+            )
+
+            # Write PDF
+            pdf_path = output_dir / label["document_name"]
+            pdf_path.write_bytes(merged_bytes)
+
+            # Write label JSON
+            json_name = label["document_name"].replace(".pdf", ".json")
+            json_path = output_dir / json_name
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(label, f, indent=2, ensure_ascii=False)
+
+            # Track stats
+            generated += 1
+            total_pages += label["total_pages"]
+            for seg in label["segments"]:
+                type_distribution[seg["file_type"]] += 1
+
+            if generated % 10 == 0 or generated == 1:
+                print(f"  [{generated}] {label['document_name']}  ({label['total_pages']} pages)")
 
     # Build manifest
     manifest = {
@@ -418,6 +568,7 @@ def run_generation(args: argparse.Namespace) -> dict:
         "created_at": datetime.now(timezone.utc).isoformat(),
         "total_documents": generated,
         "total_pages": total_pages,
+        "total_source_pdfs": total_source_pdfs,
         "file_types_used": sorted(type_distribution.keys()),
         "file_type_distribution": dict(sorted(type_distribution.items())),
         "config": {
@@ -428,6 +579,8 @@ def run_generation(args: argparse.Namespace) -> dict:
             "count": target_count,
         },
     }
+    if mode == "balanced":
+        manifest["source_pdf_reuse"] = 0
 
     manifest_path = output_dir / "manifest.json"
     with open(manifest_path, "w", encoding="utf-8") as f:
@@ -496,9 +649,8 @@ Examples:
         action="store_true",
         default=False,
         help=(
-            "Use all source PDFs with minimal reuse. Prioritises file_types "
-            "with more remaining unused PDFs so heavy types drain first and "
-            "all types converge together."
+            "Pre-plan document assignments so each source PDF is used exactly once, "
+            "producing the minimum number of merged documents. No PDF reuse."
         ),
     )
 
